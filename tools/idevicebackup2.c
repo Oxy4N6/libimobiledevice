@@ -1,4 +1,4 @@
-/*
+﻿/*
  * idevicebackup2.c
  * Command line interface to use the device's backup and restore service
  *
@@ -20,18 +20,126 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301  USA
  */
 
+
+/*
+
+	Modified 05/22/2024
+
+	Short Description:
+	- main has been replaced by wmain to provide a wchar_t* string (wide character representation) as string parameters.
+	- functions wchar_t* AnsiToWideChar(char* ansiStr) char* wchar_to_char(const wchar_t* wstr) were added to convert Ansi to wide characters
+	- pieces of code were added to the wmain function to convert wide characters to the correct encoding (from lines 1654 to 1665)
+	- the project replaced almost all standard C functions for working with the file system with wide character representations (_wstat, _wstati64, _wopendir, _wreaddir, wcscmp, _stat64, _wstat64, _wfopen)
+	- the rmdir_recursive function was rewritten to work Unicode
+	- the __wmkdir function was implemented to create folders and paths in Unicode format
+	- the function static int mkdir_with_parents(const char* dir, int mode) was fixed, which in new versions of the library got into an infinite loop when passing to the path '.'
+	- the function began to be used (the new implementation will be described below) LIBIMOBILEDEVICE_GLUE_API wchar_t* string_build_path_utf (const wchar_t* elem, ...); to replace the string_build_path function in some places
+	- the function began to be used (the new implementation will be described below) LIBIMOBILEDEVICE_GLUE_API int buffer_read_from_filename_utf(const wchar_t* filename, char** buffer, uint64_t* length);
+	- the function began to be used (the new implementation will be described below) LIBIMOBILEDEVICE_GLUE_API int plist_read_from_filename_utf (plist_t* plist, const wchar_t* filename);
+
+	// The function converts ANSI string to wchar_t string using (utf-8) charset, returns the result.
+wchar_t* AnsiToWideChar(char* ansiStr) {
+	int size_needed = MultiByteToWideChar(CP_UTF8, 0, ansiStr, -1, NULL, 0);
+	wchar_t* wstr = (wchar_t*)malloc(size_needed * sizeof(wchar_t));
+	MultiByteToWideChar(CP_UTF8, 0, ansiStr, -1, wstr, size_needed);
+	return wstr;
+}
+
+// The function creates a directory on the specified UNICODE path, returns 0 on success and -1 on error.
+static int __wmkdir(const wchar_t* path, int mode)
+{
+#ifdef WIN32
+	// CreateDirectoryW returns a non-zero value on success,
+	// and zero on failure
+	// Documentation: https://docs.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-createdirectoryw
+	return CreateDirectoryW(path, NULL) == 0;
+#else
+	// Convert wchar_t* to char* assuming UTF-8
+	// Note: This part is only a basic example. Actual implementation may require more robust handling
+	// depending on locale settings and the character encoding used.
+	size_t size = wcslen(path) * 4 + 1;  // Maximum UTF-8 length could be up to 4 bytes per character
+	char* utf8Path = malloc(size);
+	if (!utf8Path) return -1;
+
+	wcstombs(utf8Path, path, size);
+
+	// mkdir returns zero on success, and an error code on failure
+	// Documentation: https://linux.die.net/man/2/mkdir
+	int result = mkdir(utf8Path, mode);
+
+	free(utf8Path);
+	return result;
+#endif
+}
+
+// The function deletes the file at the specified path in ANSI encoding translated to UNICODE, returns the error code in case of failure.
+static int remove_file(const char* path)
+{
+	int e = 0;
+	wchar_t* wpath = AnsiToWideChar(path);
+	if (!wpath) return ENOMEM;
+
+#ifdef WIN32
+	if (!DeleteFileW(wpath)) {
+		e = GetLastError();
+	}
+#else
+	if (wremove(wpath) != 0) {
+		e = errno;
+	}
+#endif
+
+	free(wpath);
+	return e;
+}
+
+// The function converts a char string into a wchar_t string using the current locale and returns the result.
+static wchar_t* char_to_wchar(const char* str) {
+	setlocale(LC_ALL, "");
+	size_t len = mbstowcs(NULL, str, 0) + 1;
+	wchar_t* wstr = (wchar_t*)malloc(len * sizeof(wchar_t));
+	if (!wstr) return NULL;
+	mbstowcs(wstr, str, len);
+	return wstr;
+}
+
+char* wchar_to_char(const wchar_t* wstr) {
+	int size_needed = WideCharToMultiByte(CP_UTF8, 0, wstr, -1, NULL, 0, NULL, NULL);
+	char* str = (char*)malloc(size_needed);
+	WideCharToMultiByte(CP_UTF8, 0, wstr, -1, str, size_needed, NULL, NULL);
+	return str;
+}
+
+wmain:
+//	Necessity of the innovation
+//	These changes are necessary to ensure that the console application works correctly with Japanese characters in the Windows environment.The standard Windows console setup uses different code pages for UNICODE and local characters(for example, Japanese characters).Therefore, in order for an application to properly display and process text in Japanese, you need to convert strings to the appropriate code page.
+
+//	Rewriting functions to work with UNICODE
+//	All functions in wmain have been rewritten to work with UNICODE, and the main function itself has been replaced by wmain.This allows UNICODE strings(wide strings) to be used directly, making it easier to work with international texts and characters.Using wmain and UNICODE functions provides the following advantages :
+
+//Broad compatibility : Support for all characters of all languages without having to switch code pages.
+//	Uniformity : All strings within the application are treated the same, reducing errors due to incorrect encoding.
+//	Performance : Fewer conversions between different encodings while the application is running.
+//	Thus, replacing main with wmain and rewriting functions to work with UNICODE is an important step to provide full support for internationalization in console applications on Windows.
+
+// The function builds a path from a sequence of UNICODE elements, connecting them with the '/' character. Replacing the string_build_path function
+*/
+
 #ifdef HAVE_CONFIG_H
 #include <config.h>
 #endif
 
 #define TOOL_NAME "idevicebackup2"
 
+
 #include <stdio.h>
 #include <string.h>
 #include <errno.h>
 #include <stdlib.h>
 #include <signal.h>
-#include <unistd.h>
+#ifndef _MSC_VER	
+#include <unistd.h>	
+#endif
 #include <dirent.h>
 #include <libgen.h>
 #include <ctype.h>
@@ -47,15 +155,18 @@
 #include <libimobiledevice/sbservices.h>
 #include <libimobiledevice/diagnostics_relay.h>
 #include <libimobiledevice-glue/utils.h>
-#include <plist/plist.h>
 
 #include <endianness.h>
+#ifdef WIN32
+#include <windows.h>
+#endif
+#include <wchar.h>
+#include <locale.h>
 
 #define LOCK_ATTEMPTS 50
 #define LOCK_WAIT 200000
 
 #ifdef WIN32
-#include <windows.h>
 #include <conio.h>
 #define sleep(x) Sleep(x*1000)
 #ifndef ELOOP
@@ -66,6 +177,19 @@
 #include <sys/statvfs.h>
 #endif
 #include <sys/stat.h>
+
+#ifdef _MSC_VER
+void usleep(DWORD waitTime) {
+    LARGE_INTEGER perfCnt, start, now;
+
+    QueryPerformanceFrequency(&perfCnt);
+    QueryPerformanceCounter(&start);
+
+    do {
+        QueryPerformanceCounter((LARGE_INTEGER*)&now);
+    } while ((now.QuadPart - start.QuadPart) / (float)(perfCnt.QuadPart) * 1000 * 1000 < waitTime);
+}
+#endif
 
 #define CODE_SUCCESS 0x00
 #define CODE_ERROR_LOCAL 0x06
@@ -104,6 +228,105 @@ enum cmd_flags {
 };
 
 static int backup_domain_changed = 0;
+static wchar_t* char_to_wchar(const char* str);
+char* wchar_to_char(const wchar_t* wstr);
+wchar_t* AnsiToWideChar(char* ansiStr);
+
+wchar_t* string_build_path_utf(const wchar_t* elem, ...)
+{
+	if (!elem)
+		return NULL;
+
+	va_list args;
+	int len = wcslen(elem) + 1;
+	va_start(args, elem);
+	wchar_t* arg = va_arg(args, wchar_t*);
+	while (arg) {
+		len += wcslen(arg) + 1;
+		arg = va_arg(args, wchar_t*);
+	}
+	va_end(args);
+
+	wchar_t* out = (wchar_t*)malloc(len * sizeof(wchar_t));
+	if (!out)
+		return NULL;
+
+	wcscpy(out, elem);
+
+	va_start(args, elem);
+	arg = va_arg(args, wchar_t*);
+	while (arg) {
+		wcscat(out, L"/");
+		wcscat(out, arg);
+		arg = va_arg(args, wchar_t*);
+	}
+	va_end(args);
+	return out;
+}
+
+// The function reads the contents of a file named UNICODE into the buffer, returns 1 on success and 0 on error. Replacing the function buffer_read_from_filename
+int buffer_read_from_filename_utf(const wchar_t* filename, char** buffer, uint64_t* length)
+{
+	FILE* f;
+	uint64_t size;
+
+	if (!filename || !buffer || !length) {
+		return 0;
+	}
+
+	*length = 0;
+
+	f = _wfopen(filename, L"rb");
+	if (!f) {
+		return 0;
+	}
+
+	fseek(f, 0, SEEK_END);
+	size = ftell(f);
+	rewind(f);
+
+	if (size == 0) {
+		fclose(f);
+		return 0;
+	}
+
+	*buffer = (char*)malloc(sizeof(char) * (size + 1));
+
+	if (*buffer == NULL) {
+		fclose(f);
+		return 0;
+	}
+
+	int ret = 1;
+	if (fread(*buffer, sizeof(char), size, f) != size) {
+		free(*buffer);
+		ret = 0;
+		errno = EIO;
+	}
+	fclose(f);
+
+	*length = size;
+	return ret;
+}
+
+int plist_read_from_filename_utf(plist_t* plist, const wchar_t* filename)
+{
+	char* buffer = NULL;
+	uint64_t length;
+
+	if (!filename)
+		return 0;
+
+	if (!buffer_read_from_filename_utf(filename, &buffer, &length)) {
+		return 0;
+	}
+
+	plist_from_memory(buffer, length, plist);
+
+	free(buffer);
+
+	return 1;
+}
 
 static void notify_cb(const char *notification, void *userdata)
 {
@@ -174,33 +397,70 @@ static void mobilebackup_afc_get_file_contents(afc_client_t afc, const char *fil
 static int __mkdir(const char* path, int mode)
 {
 #ifdef WIN32
-	return mkdir(path);
+	// CreateDirectory returns a non-zero value on success,
+	// and zero on failure
+	// https://docs.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-createdirectorya
+	return CreateDirectory(path, NULL) == 0;
 #else
+	// mkdir returns zero on success, and an error code on failure
+	// https://linux.die.net/man/2/mkdir
 	return mkdir(path, mode);
 #endif
 }
 
-static int mkdir_with_parents(const char *dir, int mode)
+// The function creates a directory on the specified UNICODE path, returns 0 on success and -1 on error.
+static int __wmkdir(const wchar_t* path, int mode)
 {
-	if (!dir) return -1;
-	if (__mkdir(dir, mode) == 0) {
+#ifdef WIN32
+	// CreateDirectoryW returns a non-zero value on success,
+	// and zero on failure
+	// Documentation: https://docs.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-createdirectoryw
+	return CreateDirectoryW(path, NULL) == 0;
+#else
+	// Convert wchar_t* to char* assuming UTF-8
+	// Note: This part is only a basic example. Actual implementation may require more robust handling
+	// depending on locale settings and the character encoding used.
+	size_t size = wcslen(path) * 4 + 1;  // Maximum UTF-8 length could be up to 4 bytes per character
+	char* utf8Path = malloc(size);
+	if (!utf8Path) return -1;
+
+	wcstombs(utf8Path, path, size);
+
+	// mkdir returns zero on success, and an error code on failure
+	// Documentation: https://linux.die.net/man/2/mkdir
+	int result = mkdir(utf8Path, mode);
+
+	free(utf8Path);
+	return result;
+#endif
+}
+
+// The function recursively creates directories and their parent directories if they do not exist, returns 0 on success and -1 on error. Functions were changed to work with UNICODE
+static int mkdir_with_parents(const char* dir, int mode)
+{
+	//if (!dir || strcmp(dir, ".") == 0) return -1;
+	if (!dir)
+		return -1;
+	if (strcmp(dir, ".") == 0)
+		return 0;
+	if (__wmkdir(AnsiToWideChar(dir), mode) == 0) {
 		return 0;
 	}
 	if (errno == EEXIST) return 0;
 	int res;
-	char *parent = strdup(dir);
-	char *parentdir = dirname(parent);
+	char* parent = strdup(dir);
+	char* parentdir = dirname(parent);
+	//sleep(3);
 	if (parentdir) {
 		res = mkdir_with_parents(parentdir, mode);
-	} else {
+	}
+	else {
 		res = -1;
 	}
 	free(parent);
-	if (res == 0) {
-		mkdir_with_parents(dir, mode);
-	}
 	return res;
 }
+
 
 #ifdef WIN32
 static int win32err_to_errno(int err_value)
@@ -216,18 +476,24 @@ static int win32err_to_errno(int err_value)
 }
 #endif
 
+// The function deletes the file at the specified path in ANSI encoding translated to UNICODE, returns the error code in case of failure.
 static int remove_file(const char* path)
 {
 	int e = 0;
+	wchar_t* wpath = AnsiToWideChar(path);
+	if (!wpath) return ENOMEM;
+
 #ifdef WIN32
-	if (!DeleteFile(path)) {
-		e = win32err_to_errno(GetLastError());
+	if (!DeleteFileW(wpath)) {
+		e = GetLastError();
 	}
 #else
-	if (remove(path) < 0) {
+	if (wremove(wpath) != 0) {
 		e = errno;
 	}
 #endif
+
+	free(wpath);
 	return e;
 }
 
@@ -290,24 +556,45 @@ static void scan_directory(const char *path, struct entry **files, struct entry 
 	}
 }
 
+// The function converts a char string into a wchar_t string using the current locale and returns the result.
+static wchar_t* char_to_wchar(const char* str) {
+	setlocale(LC_ALL, "");
+	size_t len = mbstowcs(NULL, str, 0) + 1;
+	wchar_t* wstr = (wchar_t*)malloc(len * sizeof(wchar_t));
+	if (!wstr) return NULL;
+	mbstowcs(wstr, str, len);
+	return wstr;
+}
+
 static int rmdir_recursive(const char* path)
 {
 	int res = 0;
-	struct entry *files = NULL;
-	struct entry *directories = NULL;
-	struct entry *ent;
+	struct entry* files = NULL;
+	struct entry* directories = NULL;
+	struct entry* ent;
+
+	wchar_t* wpath = char_to_wchar(path);
+	if (!wpath) return ENOMEM;
 
 	ent = malloc(sizeof(struct entry));
-	if (!ent) return ENOMEM;
-	ent->name = strdup(path);
+	if (!ent) {
+		free(wpath);
+		return ENOMEM;
+	}
+	ent->name = wcsdup(wpath);
+	free(wpath);
+	if (!ent->name) {
+		free(ent);
+		return ENOMEM;
+	}
 	ent->next = NULL;
 	directories = ent;
 
-	scan_directory(path, &files, &directories);
+	scan_directory(wpath, &files, &directories);
 
 	ent = files;
 	while (ent) {
-		struct entry *del = ent;
+		struct entry* del = ent;
 		res = remove_file(ent->name);
 		free(ent->name);
 		ent = ent->next;
@@ -315,7 +602,7 @@ static int rmdir_recursive(const char* path)
 	}
 	ent = directories;
 	while (ent) {
-		struct entry *del = ent;
+		struct entry* del = ent;
 		res = remove_directory(ent->name);
 		free(ent->name);
 		ent = ent->next;
@@ -605,9 +892,10 @@ static int mb2_status_check_snapshot_state(const char *path, const char *udid, c
 {
 	int ret = 0;
 	plist_t status_plist = NULL;
-	char *file_path = string_build_path(path, udid, "Status.plist", NULL);
+	//char *file_path = string_build_path(path, udid, "Status.plist", NULL);
+	wchar_t* file_path = string_build_path_utf(AnsiToWideChar(path), AnsiToWideChar(udid), L"Status.plist", NULL);
 
-	plist_read_from_file(file_path, &status_plist, NULL);
+	plist_read_from_filename_utf(&status_plist, file_path);
 	free(file_path);
 	if (!status_plist) {
 		printf("Could not read Status.plist!\n");
@@ -792,6 +1080,7 @@ static int mb2_handle_send_file(mobilebackup2_client_t mobilebackup2, const char
 	/* send path length */
 	nlen = htobe32(pathlen);
 	err = mobilebackup2_send_raw(mobilebackup2, (const char*)&nlen, sizeof(nlen), &bytes);
+
 	if (err != MOBILEBACKUP2_E_SUCCESS) {
 		goto leave_proto_err;
 	}
@@ -805,13 +1094,14 @@ static int mb2_handle_send_file(mobilebackup2_client_t mobilebackup2, const char
 	if (err != MOBILEBACKUP2_E_SUCCESS) {
 		goto leave_proto_err;
 	}
+
 	if (bytes != pathlen) {
 		err = MOBILEBACKUP2_E_MUX_ERROR;
 		goto leave_proto_err;
 	}
 
 #ifdef WIN32
-	if (_stati64(localfile, &fst) < 0)
+	if (_wstati64(AnsiToWideChar(localfile), &fst) < 0)
 #else
 	if (stat(localfile, &fst) < 0)
 #endif
@@ -833,7 +1123,8 @@ static int mb2_handle_send_file(mobilebackup2_client_t mobilebackup2, const char
 		goto leave;
 	}
 
-	f = fopen(localfile, "rb");
+	
+	f = _wfopen(AnsiToWideChar(localfile), L"rb");
 	if (!f) {
 		printf("%s: Error opening local file '%s': %d\n", __func__, localfile, errno);
 		errcode = errno;
@@ -1088,7 +1379,8 @@ static int mb2_handle_receive_files(mobilebackup2_client_t mobilebackup2, plist_
 		}
 
 		remove_file(bname);
-		f = fopen(bname, "wb");
+		wchar_t* file = AnsiToWideChar(bname);
+		f = _wfopen(file, L"wb");
 		while (f && (code == CODE_FILE_DATA)) {
 			blocksize = nlen-1;
 			bdone = 0;
@@ -1182,7 +1474,7 @@ static void mb2_handle_list_directory(mobilebackup2_client_t mobilebackup2, plis
 	if (!message || (plist_get_node_type(message) != PLIST_ARRAY) || plist_array_get_size(message) < 2 || !backup_dir) return;
 
 	plist_t node = plist_array_get_item(message, 1);
-	char *str = NULL;
+	char* str = NULL;
 	if (plist_get_node_type(node) == PLIST_STRING) {
 		plist_get_string_val(node, &str);
 	}
@@ -1192,39 +1484,46 @@ static void mb2_handle_list_directory(mobilebackup2_client_t mobilebackup2, plis
 		return;
 	}
 
-	char *path = string_build_path(backup_dir, str, NULL);
+	wchar_t* path = string_build_path_utf(AnsiToWideChar(backup_dir), AnsiToWideChar(str), NULL);
+	
 	free(str);
 
 	plist_t dirlist = plist_new_dict();
 
-	DIR* cur_dir = opendir(path);
+	DIR* cur_dir = _wopendir(path);
+	if (!cur_dir)
+		printf("[mb2_handle_list_directory] ERROR#1\n");
 	if (cur_dir) {
-		struct dirent* ep;
-		while ((ep = readdir(cur_dir))) {
-			if ((strcmp(ep->d_name, ".") == 0) || (strcmp(ep->d_name, "..") == 0)) {
+		struct _wdirent* ep;
+		while ((ep = _wreaddir(cur_dir))) {
+			if ((wcscmp(ep->d_name, L".") == 0) || (wcscmp(ep->d_name, L"..") == 0)) {
 				continue;
 			}
-			char *fpath = string_build_path(path, ep->d_name, NULL);
+			wchar_t* fpath = string_build_path_utf(path, ep->d_name, NULL);
 			if (fpath) {
 				plist_t fdict = plist_new_dict();
-				struct stat st;
-				stat(fpath, &st);
-				const char *ftype = "DLFileTypeUnknown";
+				struct _stat64 st;
+				if (_wstat64(fpath, &st) != 0) {
+					printf("[mb2_handle_list_directory] ERROR OPEN WSTAT\n");
+				}
+				const char* ftype = "DLFileTypeUnknown";
 				if (S_ISDIR(st.st_mode)) {
 					ftype = "DLFileTypeDirectory";
-				} else if (S_ISREG(st.st_mode)) {
+				}
+				else if (S_ISREG(st.st_mode)) {
 					ftype = "DLFileTypeRegular";
 				}
+				const char* key = wchar_to_char(ep->d_name);
 				plist_dict_set_item(fdict, "DLFileType", plist_new_string(ftype));
 				plist_dict_set_item(fdict, "DLFileSize", plist_new_uint(st.st_size));
 				plist_dict_set_item(fdict, "DLFileModificationDate",
-						    plist_new_date(st.st_mtime - MAC_EPOCH, 0));
-
-				plist_dict_set_item(dirlist, ep->d_name, fdict);
+					plist_new_date(st.st_mtime - MAC_EPOCH, 0));
+				plist_dict_set_item(dirlist, key, fdict);
 				free(fpath);
 			}
 		}
-		closedir(cur_dir);
+		_wclosedir(cur_dir);
+		
 	}
 	free(path);
 
@@ -1250,14 +1549,19 @@ static void mb2_handle_make_directory(mobilebackup2_client_t mobilebackup2, plis
 	free(str);
 
 	if (mkdir_with_parents(newpath, 0755) < 0) {
+
 		errdesc = strerror(errno);
+
 		if (errno != EEXIST) {
 			printf("mkdir: %s (%d)\n", errdesc, errno);
 		}
+
 		errcode = errno_to_device_error(errno);
 	}
 	free(newpath);
+
 	mobilebackup2_error_t err = mobilebackup2_send_status_response(mobilebackup2, errcode, errdesc, NULL);
+
 	if (err != MOBILEBACKUP2_E_SUCCESS) {
 		printf("Could not send status response, error %d\n", err);
 	}
@@ -1465,8 +1769,47 @@ static void print_usage(int argc, char **argv, int is_error)
 
 #define DEVICE_VERSION(maj, min, patch) ((((maj) & 0xFF) << 16) | (((min) & 0xFF) << 8) | ((patch) & 0xFF))
 
-int main(int argc, char *argv[])
+// The function converts ANSI string to wchar_t string using (utf-8) charset, returns the result.
+wchar_t* AnsiToWideChar(char* ansiStr) {
+	int size_needed = MultiByteToWideChar(CP_UTF8, 0, ansiStr, -1, NULL, 0);
+	wchar_t* wstr = (wchar_t*)malloc(size_needed * sizeof(wchar_t));
+	MultiByteToWideChar(CP_UTF8, 0, ansiStr, -1, wstr, size_needed);
+	return wstr;
+}
+
+char* wchar_to_char(const wchar_t* wstr) {
+	int size_needed = WideCharToMultiByte(CP_UTF8, 0, wstr, -1, NULL, 0, NULL, NULL);
+	char* str = (char*)malloc(size_needed);
+	WideCharToMultiByte(CP_UTF8, 0, wstr, -1, str, size_needed, NULL, NULL);
+	return str;
+}
+
+int wmain(int argc, wchar_t *argv[])
 {
+
+	//	Necessity of the innovation
+	//	These changes are necessary to ensure that the console application works correctly with Japanese characters in the Windows environment.The standard Windows console setup uses different code pages for UNICODE and local characters(for example, all UTF).Therefore, in order for an application to properly display and process text in UTF, you need to convert strings to the appropriate code page.
+
+	//	Rewriting functions to work with UNICODE
+	//	All functions in wmain have been rewritten to work with UNICODE, and the main function itself has been replaced by wmain.This allows UNICODE strings(wide strings) to be used directly, making it easier to work with international texts and characters.Using wmain and UNICODE functions provides the following advantages :
+
+	//	Broad compatibility : Support for all characters of all languages without having to switch code pages.
+	//	Uniformity : All strings within the application are treated the same, reducing errors due to incorrect encoding.
+	//	Performance : Fewer conversions between different encodings while the application is running.
+	//	Thus, replacing main with wmain and rewriting functions to work with UNICODE is an important step to provide full support for internationalization in console applications on Windows.
+
+	setlocale(LC_ALL, "");
+	SetConsoleOutputCP(CP_UTF8);
+
+	char** argvT = malloc(argc * sizeof(char*));
+	for (int i = 0; i < argc; ++i) {
+		int utf8_size = WideCharToMultiByte(CP_UTF8, 0, argv[i], -1, NULL, 0, NULL, NULL);
+		argvT[i] = malloc(utf8_size);
+
+		WideCharToMultiByte(CP_UTF8, 0, argv[i], -1, argvT[i], utf8_size, NULL, NULL);
+	}
+
+
 	idevice_error_t ret = IDEVICE_E_UNKNOWN_ERROR;
 	lockdownd_error_t ldret = LOCKDOWN_E_UNKNOWN_ERROR;
 	int i = 0;
@@ -1536,7 +1879,7 @@ int main(int argc, char *argv[])
 #endif
 
 	/* parse cmdline args */
-	while ((c = getopt_long(argc, argv, "dhu:s:inv", longopts, NULL)) != -1) {
+	while ((c = getopt_long(argc, argvT, "dhu:s:inv", longopts, NULL)) != -1) {
 		switch (c) {
 		case 'd':
 			idevice_set_debug_level(1);
@@ -1544,7 +1887,7 @@ int main(int argc, char *argv[])
 		case 'u':
 			if (!*optarg) {
 				fprintf(stderr, "ERROR: UDID argument must not be empty!\n");
-				print_usage(argc, argv, 1);
+				print_usage(argc, argvT, 1);
 				return 2;
 			}
 			udid = strdup(optarg);
@@ -1552,11 +1895,10 @@ int main(int argc, char *argv[])
 		case 's':
 			if (!*optarg) {
 				fprintf(stderr, "ERROR: SOURCE argument must not be empty!\n");
-				print_usage(argc, argv, 1);
+				print_usage(argc, argvT, 1);
 				return 2;
 			}
 			source_udid = strdup(optarg);
-			break;
 		case 'i':
 			interactive_mode = 1;
 			break;
@@ -1564,7 +1906,7 @@ int main(int argc, char *argv[])
 			use_network = 1;
 			break;
 		case 'h':
-			print_usage(argc, argv, 0);
+			print_usage(argc, argvT, 0);
 			return 0;
 		case 'v':
 			printf("%s %s\n", TOOL_NAME, PACKAGE_VERSION);
@@ -1598,69 +1940,69 @@ int main(int argc, char *argv[])
 			cmd_flags |= CMD_FLAG_FORCE_FULL_BACKUP;
 			break;
 		default:
-			print_usage(argc, argv, 1);
+			print_usage(argc, argvT, 1);
 			return 2;
 		}
 	}
 	argc -= optind;
-	argv += optind;
+	argvT += optind;
 
-	if (!argv[0]) {
+	if (!argvT[0]) {
 		fprintf(stderr, "ERROR: No command specified.\n");
-		print_usage(argc+optind, argv-optind, 1);
+		print_usage(argc+optind, argvT-optind, 1);
 		return 2;
 	}
 
-	if (!strcmp(argv[0], "backup")) {
+	if (!strcmp(argvT[0], "backup")) {
 		cmd = CMD_BACKUP;
 	}
-	else if (!strcmp(argv[0], "restore")) {
+	else if (!strcmp(argvT[0], "restore")) {
 		cmd = CMD_RESTORE;
 	}
-	else if (!strcmp(argv[0], "cloud")) {
+	else if (!strcmp(argvT[0], "cloud")) {
 		cmd = CMD_CLOUD;
 		i = 1;
-		if (!argv[i]) {
+		if (!argvT[i]) {
 			fprintf(stderr, "ERROR: No argument given for cloud command; requires either 'on' or 'off'.\n");
-			print_usage(argc+optind, argv-optind, 1);
+			print_usage(argc+optind, argvT-optind, 1);
 			return 2;
 		}
-		if (!strcmp(argv[i], "on")) {
+		if (!strcmp(argvT[i], "on")) {
 			cmd_flags |= CMD_FLAG_CLOUD_ENABLE;
-		} else if (!strcmp(argv[i], "off")) {
+		} else if (!strcmp(argvT[i], "off")) {
 			cmd_flags |= CMD_FLAG_CLOUD_DISABLE;
 		} else {
-			fprintf(stderr, "ERROR: Invalid argument '%s' for cloud command; must be either 'on' or 'off'.\n", argv[i]);
-			print_usage(argc+optind, argv-optind, 1);
+			fprintf(stderr, "ERROR: Invalid argument '%s' for cloud command; must be either 'on' or 'off'.\n", argvT[i]);
+			print_usage(argc+optind, argvT-optind, 1);
 			return 2;
 		}
 	}
-	else if (!strcmp(argv[0], "info")) {
+	else if (!strcmp(argvT[0], "info")) {
 		cmd = CMD_INFO;
 		verbose = 0;
 	}
-	else if (!strcmp(argv[0], "list")) {
+	else if (!strcmp(argvT[0], "list")) {
 		cmd = CMD_LIST;
 		verbose = 0;
 	}
-	else if (!strcmp(argv[0], "unback")) {
+	else if (!strcmp(argvT[0], "unback")) {
 		cmd = CMD_UNBACK;
 	}
-	else if (!strcmp(argv[0], "encryption")) {
+	else if (!strcmp(argvT[0], "encryption")) {
 		cmd = CMD_CHANGEPW;
 		i = 1;
-		if (!argv[i]) {
+		if (!argvT[i]) {
 			fprintf(stderr, "ERROR: No argument given for encryption command; requires either 'on' or 'off'.\n");
-			print_usage(argc+optind, argv-optind, 1);
+			print_usage(argc+optind, argvT-optind, 1);
 			return 2;
 		}
-		if (!strcmp(argv[i], "on")) {
+		if (!strcmp(argvT[i], "on")) {
 			cmd_flags |= CMD_FLAG_ENCRYPTION_ENABLE;
-		} else if (!strcmp(argv[i], "off")) {
+		} else if (!strcmp(argvT[i], "off")) {
 			cmd_flags |= CMD_FLAG_ENCRYPTION_DISABLE;
 		} else {
-			fprintf(stderr, "ERROR: Invalid argument '%s' for encryption command; must be either 'on' or 'off'.\n", argv[i]);
-			print_usage(argc+optind, argv-optind, 1);
+			fprintf(stderr, "ERROR: Invalid argument '%s' for encryption command; must be either 'on' or 'off'.\n", argvT[i]);
+			print_usage(argc+optind, argvT-optind, 1);
 			return 2;
 		}
 		// check if a password was given on the command line
@@ -1669,15 +2011,15 @@ int main(int argc, char *argv[])
 		free(backup_password);
 		backup_password = NULL;
 		i++;
-		if (argv[i]) {
+		if (argvT[i]) {
 			if (cmd_flags & CMD_FLAG_ENCRYPTION_ENABLE) {
-				newpw = strdup(argv[i]);
+				newpw = strdup(argvT[i]);
 			} else if (cmd_flags & CMD_FLAG_ENCRYPTION_DISABLE) {
-				backup_password = strdup(argv[i]);
+				backup_password = strdup(argvT[i]);
 			}
 		}
 	}
-	else if (!strcmp(argv[0], "changepw")) {
+	else if (!strcmp(argvT[0], "changepw")) {
 		cmd = CMD_CHANGEPW;
 		cmd_flags |= CMD_FLAG_ENCRYPTION_CHANGEPW;
 		// check if passwords were given on command line
@@ -1686,27 +2028,27 @@ int main(int argc, char *argv[])
 		free(backup_password);
 		backup_password = NULL;
 		i = 1;
-		if (argv[i]) {
-			backup_password = strdup(argv[i]);
+		if (argvT[i]) {
+			backup_password = strdup(argvT[i]);
 			i++;
-			if (!argv[i]) {
+			if (!argvT[i]) {
 				fprintf(stderr, "ERROR: Old and new passwords have to be passed as arguments for the changepw command\n");
-				print_usage(argc+optind, argv-optind, 1);
+				print_usage(argc+optind, argvT-optind, 1);
 				return 2;
 			}
-			newpw = strdup(argv[i]);
+			newpw = strdup(argvT[i]);
 		}
 	}
 
 	i++;
-	if (argv[i]) {
-		backup_directory = argv[i];
+	if (argvT[i]) {
+		backup_directory = argvT[i];
 	}
 
 	/* verify options */
 	if (cmd == -1) {
-		fprintf(stderr, "ERROR: Unsupported command '%s'.\n", argv[0]);
-		print_usage(argc+optind, argv-optind, 1);
+		fprintf(stderr, "ERROR: Unsupported command '%s'.\n", argvT[0]);
+		print_usage(argc+optind, argvT-optind, 1);
 		return 2;
 	}
 
@@ -1715,12 +2057,12 @@ int main(int argc, char *argv[])
 	} else {
 		if (backup_directory == NULL) {
 			fprintf(stderr, "ERROR: No target backup directory specified.\n");
-			print_usage(argc+optind, argv-optind, 1);
+			print_usage(argc+optind, argvT-optind, 1);
 			return 2;
 		}
 
 		/* verify if passed backup directory exists */
-		if (stat(backup_directory, &st) != 0) {
+		if (_wstat(AnsiToWideChar(backup_directory), &st) != 0) {
 			fprintf(stderr, "ERROR: Backup directory \"%s\" does not exist!\n", backup_directory);
 			return -1;
 		}
@@ -1781,7 +2123,7 @@ int main(int argc, char *argv[])
 				free(info_path);
 			}
 			plist_t manifest_plist = NULL;
-			plist_read_from_file(manifest_path, &manifest_plist, NULL);
+			plist_read_from_filename(&manifest_plist, manifest_path);
 			if (!manifest_plist) {
 				idevice_free(device);
 				free(info_path);
@@ -1937,7 +2279,7 @@ int main(int argc, char *argv[])
 		/* verify existing Info.plist */
 		if (info_path && (stat(info_path, &st) == 0) && cmd != CMD_CLOUD) {
 			PRINT_VERBOSE(1, "Reading Info.plist from backup.\n");
-			plist_read_from_file(info_path, &info_plist, NULL);
+			plist_read_from_filename(&info_plist, info_path);
 
 			if (!info_plist) {
 				printf("Could not read Info.plist\n");
@@ -2002,8 +2344,20 @@ checkpoint:
 
 			/* make sure backup device sub-directory exists */
 			char* devbackupdir = string_build_path(backup_directory, source_udid, NULL);
-			__mkdir(devbackupdir, 0755);
+			result_code = __wmkdir(AnsiToWideChar(devbackupdir), 0755);
 			free(devbackupdir);
+
+			if (result_code != 0) {
+#ifdef WIN32
+				if (GetLastError() != ERROR_ALREADY_EXISTS) {
+#else
+				if (errno != EEXIST) {
+#endif
+					printf("Error creating the backup directory, error code\n");
+					cmd = CMD_LEAVE;
+					break;
+				}
+			}
 
 			if (strcmp(source_udid, udid) != 0) {
 				/* handle different source backup directory */
@@ -2031,7 +2385,7 @@ checkpoint:
 				cmd = CMD_LEAVE;
 			}
 			remove_file(info_path);
-			plist_write_to_file(info_plist, info_path, PLIST_FORMAT_XML, 0);
+			plist_write_to_filename(info_plist, info_path, PLIST_FORMAT_XML);
 			free(info_path);
 
 			plist_free(info_plist);
@@ -2356,11 +2710,13 @@ checkpoint:
 									free(str);
 									char *oldpath = string_build_path(backup_directory, key, NULL);
 
-									if ((stat(newpath, &st) == 0) && S_ISDIR(st.st_mode))
+									
+									if ((_wstat(AnsiToWideChar(newpath), &st) == 0) && S_ISDIR(st.st_mode))
 										rmdir_recursive(newpath);
 									else
 										remove_file(newpath);
-									if (rename(oldpath, newpath) < 0) {
+									
+									if (_wrename(AnsiToWideChar(oldpath), AnsiToWideChar(newpath)) < 0) {
 										printf("Renameing '%s' to '%s' failed: %s (%d)\n", oldpath, newpath, strerror(errno), errno);
 										errcode = errno_to_device_error(errno);
 										errdesc = strerror(errno);
@@ -2409,7 +2765,7 @@ checkpoint:
 								char *newpath = string_build_path(backup_directory, str, NULL);
 								free(str);
 								int res = 0;
-								if ((stat(newpath, &st) == 0) && S_ISDIR(st.st_mode)) {
+								if ((_wstat(AnsiToWideChar(newpath), &st) == 0) && S_ISDIR(st.st_mode)) {
 									res = rmdir_recursive(newpath);
 								} else {
 									res = remove_file(newpath);
@@ -2417,9 +2773,12 @@ checkpoint:
 								if (res != 0 && res != ENOENT) {
 									if (!suppress_warning)
 										printf("Could not remove '%s': %s (%d)\n", newpath, strerror(res), res);
+
+									printf("res: %d\n", res);
 									errcode = errno_to_device_error(res);
 									errdesc = strerror(res);
 								}
+								printf("res: %d\n", res);
 								free(newpath);
 							}
 						}
