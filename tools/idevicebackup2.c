@@ -133,6 +133,10 @@ wmain:
 // Fixed bug on new IOS calling connectivity to com.com.apple.iTunes network
 
 
+// Modified 11/11/2024
+// Fixed bug flush std finished
+
+
 #ifdef HAVE_CONFIG_H
 #include <config.h>
 #endif
@@ -493,6 +497,8 @@ static int remove_file(const char* path)
 {
 	int e = 0;
 	wchar_t* wpath = AnsiToWideChar(path);
+	//wprintf(L"[remove_file]: path%ls\n", path);
+	//wprintf(L"[remove_file]: %ls\n", wpath);
 	if (!wpath) return ENOMEM;
 
 #ifdef WIN32
@@ -510,10 +516,28 @@ static int remove_file(const char* path)
 	return e;
 }
 
+//static int remove_directory(const char* path)
+//{
+//	int e = 0;
+//#ifdef WIN32
+//	if (!RemoveDirectory(path)) {
+//		e = win32err_to_errno(GetLastError());
+//	}
+//#else
+//	if (remove(path) < 0) {
+//		e = errno;
+//	}
+//#endif
+//	return e;
+//}
+
 static int remove_directory(const char* path)
 {
 	int e = 0;
 	wchar_t* wpath = AnsiToWideChar(path);
+	//wprintf(L"[remove_directory]: path%ls\n", path);
+	//wprintf(L"[remove_directory]: %ls\n", wpath);
+	//printf(L"[remove_directory]2: %s\n", path);
 	if (!wpath) return ENOMEM;
 
 #ifdef WIN32
@@ -1800,7 +1824,6 @@ int wmain(int argc, wchar_t* argv[])
 	//	Uniformity : All strings within the application are treated the same, reducing errors due to incorrect encoding.
 	//	Performance : Fewer conversions between different encodings while the application is running.
 	//	Thus, replacing main with wmain and rewriting functions to work with UNICODE is an important step to provide full support for internationalization in console applications on Windows.
-
 	setlocale(LC_ALL, "");
 	SetConsoleOutputCP(CP_UTF8);
 
@@ -2975,7 +2998,11 @@ checkpointRestart:
 			case CMD_BACKUP:
 				PRINT_VERBOSE(1, "Received %d files from device.\n", file_count);
 				if (operation_ok && mb2_status_check_snapshot_state(backup_directory, udid, "finished")) {
+					
 					PRINT_VERBOSE(1, "Backup Successful.\n");
+
+					fflush(stdout);
+					sleep(1);
 				}
 				else {
 					if (quit_flag) {
